@@ -46,6 +46,19 @@ class AdapterLoader(ComponentLoader):
         config.pop("_diffusers_version", None)
         config.pop("_name_or_path", None)
 
+        if config.get("per_modality_projections"):
+            # SGL-D's own LTX2TextConnectors reimplementation only has the
+            # single shared text_proj_in path (LTX-2.0). LTX-2.3/2.5
+            # checkpoints use per-modality (separate video/audio)
+            # projections, a different architecture branch this class does
+            # not implement. Force a fallback to the native (diffusers)
+            # implementation instead of silently loading with
+            # mismatched/missing weights.
+            raise ValueError(
+                "per_modality_projections=True (LTX-2.3+) is not supported by "
+                "SGL-D's customized LTX2TextConnectors; falling back to native."
+            )
+
         server_args.model_paths["connectors"] = component_model_path
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
@@ -65,12 +78,45 @@ class AdapterLoader(ComponentLoader):
         safetensors_list = _list_safetensors_files(component_model_path)
         if not safetensors_list:
             raise ValueError(f"No safetensors files found in {component_model_path}")
-        if len(safetensors_list) != 1:
-            raise ValueError(
-                f"Found {len(safetensors_list)} safetensors files in {component_model_path}, expected 1"
-            )
 
-        loaded = safetensors_load_file(safetensors_list[0])
+        if len(safetensors_list) == 1:
+            loaded = safetensors_load_file(safetensors_list[0])
+        else:
+            import os
+            import re
+
+            # Some checkpoints (e.g. LTX-2.5's connectors) redundantly ship a
+            # fully-consolidated single file alongside a sharded pair with an
+            # index.json. Prefer the consolidated (non-shard-suffixed) file
+            # when present; otherwise merge shards via the index weight map.
+            shard_pattern = re.compile(r"-\d+-of-\d+\.safetensors$")
+            consolidated = [f for f in safetensors_list if not shard_pattern.search(f)]
+            if len(consolidated) == 1:
+                loaded = safetensors_load_file(consolidated[0])
+            else:
+                index_candidates = [
+                    os.path.join(component_model_path, f)
+                    for f in os.listdir(component_model_path)
+                    if f.endswith(".safetensors.index.json")
+                ]
+                if not index_candidates:
+                    raise ValueError(
+                        f"Found {len(safetensors_list)} safetensors files in "
+                        f"{component_model_path} with no unambiguous consolidated "
+                        "file and no *.safetensors.index.json to merge shards."
+                    )
+                import json
+
+                with open(index_candidates[0]) as fh:
+                    weight_map = json.load(fh)["weight_map"]
+                loaded = {}
+                shard_cache = {}
+                for param_name, shard_file in weight_map.items():
+                    shard_path = os.path.join(component_model_path, shard_file)
+                    if shard_path not in shard_cache:
+                        shard_cache[shard_path] = safetensors_load_file(shard_path)
+                    loaded[param_name] = shard_cache[shard_path][param_name]
+
         model.load_state_dict(loaded, strict=False)
 
         return model

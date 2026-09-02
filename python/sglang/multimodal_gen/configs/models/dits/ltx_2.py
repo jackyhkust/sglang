@@ -67,6 +67,8 @@ class LTX2ArchConfig(DiTArchConfig):
             r"^time_embed\.(.*)$": r"adaln_single.\1",
             r"^audio_proj_in\.(.*)$": r"audio_patchify_proj.\1",
             r"^audio_time_embed\.(.*)$": r"audio_adaln_single.\1",
+            r"^prompt_adaln\.(.*)$": r"prompt_adaln_single.\1",
+            r"^audio_prompt_adaln\.(.*)$": r"audio_prompt_adaln_single.\1",
             # FeedForward
             r"(.*)ff\.net\.0\.proj\.(.*)$": r"\1ff.proj_in.\2",
             r"(.*)ff\.net\.2\.(.*)$": r"\1ff.proj_out.\2",
@@ -128,6 +130,17 @@ class LTX2ArchConfig(DiTArchConfig):
     cross_attention_adaln: bool = False
     caption_proj_before_connector: bool = False
 
+    # LTX-2.5 transformer/config.json uses different field names than SGL-D's
+    # own arch config for the same concepts; SGL-D's model class already
+    # implements both, but update_model_arch() only sets attrs that match a
+    # dataclass field name exactly (mismatches are silently dropped into
+    # extra_attrs). These aliases capture the checkpoint's raw names so
+    # __post_init__ can bridge them onto the real fields below.
+    gated_attn: bool | None = None
+    audio_gated_attn: bool | None = None
+    use_prompt_adaln_single: bool | None = None
+    use_keyframes_abs_pos_embedding: bool | None = None
+
     # Video parameters
     num_attention_heads: int = 32
     attention_head_dim: int = 128
@@ -166,6 +179,19 @@ class LTX2ArchConfig(DiTArchConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        # Bridge LTX-2.5 checkpoint field names onto SGL-D's existing fields
+        # (see the alias fields above for why this is needed).
+        if self.gated_attn is not None:
+            self.apply_gated_attention = bool(self.gated_attn)
+        if self.use_prompt_adaln_single is not None:
+            self.cross_attention_adaln = bool(self.use_prompt_adaln_single)
+            # LTX-2.5's `transformer/` checkpoint ships no caption_projection /
+            # audio_caption_projection weights at all: caption projection is
+            # done once in the (per-modality) connectors instead. Whenever
+            # use_prompt_adaln_single is set, treat this as an LTX-2.5-style
+            # checkpoint and skip constructing the transformer-local
+            # projection layers accordingly.
+            self.caption_proj_before_connector = True
         # Video derived values
         self.hidden_size = self.num_attention_heads * self.attention_head_dim
         self.num_channels_latents = self.out_channels

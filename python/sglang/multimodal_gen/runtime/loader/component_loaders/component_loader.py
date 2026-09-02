@@ -360,6 +360,35 @@ class ComponentLoader(ABC):
                 trust_remote_code=server_args.trust_remote_code,
                 **load_kwargs,
             )
+        elif transformers_or_diffusers == "ltx2":
+            # LTX-2.5 ships a few helper components (text/audio connectors, the
+            # BWE vocoder) tagged with library "ltx2" in model_index.json. These
+            # live in diffusers.pipelines.ltx2.* as ModelMixin/ConfigMixin
+            # subclasses but are not registered with diffusers' AutoModel, so we
+            # resolve and load them directly here.
+            import importlib
+
+            _LTX2_COMPONENT_CLASSES = {
+                "connectors": ("diffusers.pipelines.ltx2.connectors", "LTX2TextConnectors"),
+                "vocoder": ("diffusers.pipelines.ltx2.vocoder", "LTX2VocoderWithBWE"),
+            }
+            if component_name not in _LTX2_COMPONENT_CLASSES:
+                raise ValueError(
+                    f"Unsupported 'ltx2' library component: {component_name!r}. "
+                    f"Known components: {sorted(_LTX2_COMPONENT_CLASSES)}"
+                )
+            module_path, class_name = _LTX2_COMPONENT_CLASSES[component_name]
+            ltx2_module = importlib.import_module(module_path)
+            ltx2_cls = getattr(ltx2_module, class_name)
+
+            component_model_path = prepare_diffusers_component_path_for_loading(
+                component_model_path
+            )
+            return ltx2_cls.from_pretrained(
+                component_model_path,
+                revision=server_args.revision,
+                **load_kwargs,
+            )
         else:
             raise ValueError(f"Unsupported library: {transformers_or_diffusers}")
 

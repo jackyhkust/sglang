@@ -5,6 +5,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
+try:
+    from diffusers.pipelines.ltx2.connectors import (
+        LTX2TextConnectors as _DiffusersLTX2TextConnectors,
+    )
+except ImportError:  # pragma: no cover - diffusers always available here
+    _DiffusersLTX2TextConnectors = None
+
 
 class LTX2TextConnectorStage(PipelineStage):
     """
@@ -15,6 +22,27 @@ class LTX2TextConnectorStage(PipelineStage):
     def __init__(self, connectors):
         super().__init__()
         self.connectors = connectors
+
+    def _call_connectors(self, embeds: torch.Tensor, attention_mask: torch.Tensor):
+        """Call self.connectors with whichever signature its concrete class expects.
+
+        SGL-D's own LTX2TextConnectors (LTX-2.0/2.3, single shared
+        text_proj_in) expects a pre-converted additive mask plus
+        additive_mask=True. diffusers' native LTX2TextConnectors (used for
+        LTX-2.5's per-modality dual video/audio projection scheme, which
+        SGL-D's own class does not implement) expects the raw binary mask
+        and performs the additive conversion itself.
+        """
+        if _DiffusersLTX2TextConnectors is not None and isinstance(
+            self.connectors, _DiffusersLTX2TextConnectors
+        ):
+            return self.connectors(embeds, attention_mask)
+
+        dtype = embeds.dtype
+        additive_mask = (attention_mask.to(torch.int64) - 1).to(
+            dtype
+        ) * torch.finfo(dtype).max
+        return self.connectors(embeds, additive_mask, additive_mask=True)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         # Input: batch.prompt_embeds (from Gemma, [B, S, D])
@@ -60,20 +88,12 @@ class LTX2TextConnectorStage(PipelineStage):
 
             # Official LTX-2.3 processes positive and negative prompts through
             # the connector independently; batching shifts output numerics.
-            dtype = prompt_embeds.dtype
-            pos_additive_mask = (prompt_attention_mask.to(torch.int64) - 1).to(
-                dtype
-            ) * torch.finfo(dtype).max
-            neg_additive_mask = (neg_prompt_attention_mask.to(torch.int64) - 1).to(
-                dtype
-            ) * torch.finfo(dtype).max
-
             with set_forward_context(current_timestep=None, attn_metadata=None):
-                pos_embeds, pos_audio_embeds, pos_mask = self.connectors(
-                    prompt_embeds, pos_additive_mask, additive_mask=True
+                pos_embeds, pos_audio_embeds, pos_mask = self._call_connectors(
+                    prompt_embeds, prompt_attention_mask
                 )
-                neg_embeds, neg_audio_embeds, neg_mask = self.connectors(
-                    neg_prompt_embeds, neg_additive_mask, additive_mask=True
+                neg_embeds, neg_audio_embeds, neg_mask = self._call_connectors(
+                    neg_prompt_embeds, neg_prompt_attention_mask
                 )
 
             batch.prompt_embeds = [pos_embeds]
@@ -83,20 +103,12 @@ class LTX2TextConnectorStage(PipelineStage):
             batch.negative_audio_prompt_embeds = [neg_audio_embeds]
             batch.negative_attention_mask = neg_mask
         else:
-            # Prepare additive mask for connectors (as per diffusers implementation)
-            dtype = prompt_embeds.dtype
-            additive_attention_mask = (prompt_attention_mask.to(torch.int64) - 1).to(
-                dtype
-            ) * torch.finfo(dtype).max
-
             with set_forward_context(current_timestep=None, attn_metadata=None):
                 (
                     connector_prompt_embeds,
                     connector_audio_prompt_embeds,
                     connector_mask,
-                ) = self.connectors(
-                    prompt_embeds, additive_attention_mask, additive_mask=True
-                )
+                ) = self._call_connectors(prompt_embeds, prompt_attention_mask)
 
             batch.prompt_embeds = [connector_prompt_embeds]
             batch.audio_prompt_embeds = [connector_audio_prompt_embeds]
