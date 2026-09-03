@@ -187,10 +187,7 @@ class LTX2ArchConfig(DiTArchConfig):
             self.cross_attention_adaln = bool(self.use_prompt_adaln_single)
             # LTX-2.5's `transformer/` checkpoint ships no caption_projection /
             # audio_caption_projection weights at all: caption projection is
-            # done once in the (per-modality) connectors instead. Whenever
-            # use_prompt_adaln_single is set, treat this as an LTX-2.5-style
-            # checkpoint and skip constructing the transformer-local
-            # projection layers accordingly.
+            # done once in the (per-modality) connectors instead.
             self.caption_proj_before_connector = True
         # Video derived values
         self.hidden_size = self.num_attention_heads * self.attention_head_dim
@@ -205,6 +202,28 @@ class LTX2ArchConfig(DiTArchConfig):
         if self.audio_positional_embedding_max_pos is None:
             self.audio_positional_embedding_max_pos = [20]
 
+    def resolve_structure_from_checkpoint(
+        self, checkpoint_param_names: set[str]
+    ) -> None:
+        """Resolve structural flags from the checkpoint's parameter names.
+
+        LTX-2.0, 2.3 and 2.5 disagree on whether caption projection and prompt
+        adaptive layer norm live in the transformer, but transformer/config.json
+        only records this from 2.5 onwards: LTX-2.3 ships the 2.5 layout while
+        its config.json still looks like 2.0's. The weights are unambiguous for
+        every version, so they take precedence over the config fields.
+        """
+        if not checkpoint_param_names:
+            return
+        self.caption_proj_before_connector = not any(
+            name.startswith(("caption_projection.", "audio_caption_projection."))
+            for name in checkpoint_param_names
+        )
+        self.cross_attention_adaln = any(
+            name.startswith(("prompt_adaln.", "audio_prompt_adaln."))
+            for name in checkpoint_param_names
+        )
+
 
 @dataclass
 class LTX2Config(DiTConfig):
@@ -214,3 +233,7 @@ class LTX2Config(DiTConfig):
 
     prefix: str = "ltx2"
     torch_compile_mode: str = "default"
+
+    def post_init_from_checkpoint(self, checkpoint_param_names: set[str]) -> None:
+        """Called by TransformerLoader after update_model_arch() merges config.json."""
+        self.arch_config.resolve_structure_from_checkpoint(checkpoint_param_names)

@@ -1,5 +1,8 @@
 import copy
+import glob
+import json
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any
 
@@ -120,6 +123,40 @@ def _server_args_for_transformer_component(
     return component_server_args
 
 
+def _read_checkpoint_param_names(
+    component_model_path: str, safetensors_list: list[str]
+) -> set[str]:
+    """Read parameter names from a checkpoint without loading any tensor data.
+
+    Prefers the safetensors index, which lists every key across all shards, and
+    otherwise reads the header of each file. Returns an empty set if the names
+    cannot be determined, so callers can fall back to config-derived values.
+    """
+    index_paths = glob.glob(
+        os.path.join(str(component_model_path), "*.safetensors.index.json")
+    )
+    if index_paths:
+        try:
+            with open(index_paths[0]) as f:
+                return set(json.load(f).get("weight_map", {}))
+        except (OSError, ValueError) as e:
+            logger.debug("Could not read safetensors index %s: %s", index_paths[0], e)
+
+    try:
+        from safetensors import safe_open
+
+        names: set[str] = set()
+        for path in safetensors_list:
+            with safe_open(path, framework="pt") as f:
+                names.update(f.keys())
+        return names
+    except Exception as e:
+        logger.debug(
+            "Could not read safetensors headers in %s: %s", component_model_path, e
+        )
+        return set()
+
+
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
@@ -172,6 +209,12 @@ class TransformerLoader(ComponentLoader):
             raise ValueError(f"Invalid module name: {component_name}")
         dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
         dit_config.update_model_arch(config)
+        if hasattr(dit_config, "post_init_from_checkpoint"):
+            # NOTE: some structural flags cannot be derived from config.json alone
+            # and have to be read off the checkpoint's parameter names.
+            dit_config.post_init_from_checkpoint(
+                _read_checkpoint_param_names(component_model_path, safetensors_list)
+            )
 
         cls_name = config.pop("_class_name")
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
