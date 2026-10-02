@@ -78,6 +78,11 @@ def vdn_delta_factors(
 def can_use_vdn_delta_factors(
     A: torch.Tensor, B: torch.Tensor, alpha: torch.Tensor
 ) -> bool:
+    # The JIT compiles a CUDA .cuh. gfx950 reports a compute capability >= 8,
+    # so the check below would try that build on HIP. The eager Cholesky path
+    # is the ROCm implementation.
+    if torch.version.hip is not None:
+        return False
     return (
         A.is_cuda
         and A.dtype is torch.float32

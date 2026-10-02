@@ -45,11 +45,11 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 
 VDN_MODEL_ID = "OpenVDN/vdn-minimax-h3"
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-# admission resolves hybrid_window_attn_h3, which only the CUDA platform registers
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+# admission resolves hybrid_window_attn_h3, registered on CUDA and ROCm
 requires_cuda_backend = pytest.mark.skipif(
-    not current_platform.is_cuda(),
-    reason="hybrid_window_attn_h3 admission needs NVIDIA CUDA",
+    not (current_platform.is_cuda() or current_platform.is_rocm()),
+    reason="hybrid_window_attn_h3 admission needs CUDA or ROCm",
 )
 
 
@@ -74,8 +74,10 @@ def test_registry_resolves_vdn_h3_configs() -> None:
 def test_vdn_h3_sampling_defaults_and_rejections() -> None:
     params = VDNH3SamplingParams(prompt="p")
     assert params.num_inference_steps == 9  # 8 NFE
-    with pytest.raises(ValueError, match="exactly nine sigma grid points"):
+    with pytest.raises(ValueError, match="nine sigma grid points"):
         VDNH3SamplingParams(prompt="p", num_inference_steps=8)
+    comparison = VDNH3SamplingParams(prompt="p", num_inference_steps=50)
+    assert comparison.num_inference_steps == 50
     fl2va = VDNH3SamplingParams(
         prompt="p",
         task="fl2va",
@@ -129,8 +131,7 @@ def test_vdn_h3_pipeline_config_rejections() -> None:
         config.validate_server_args(_server_args(attention_backend="fa"))
     with pytest.raises(ValueError, match="ring-degree"):
         config.validate_server_args(_server_args(ring_degree=2))
-    with pytest.raises(ValueError, match="torch.compile"):
-        config.validate_server_args(_server_args(enable_torch_compile=True))
+    config.validate_server_args(_server_args(enable_torch_compile=True))
     with pytest.raises(ValueError, match="breakable CUDA graph"):
         config.validate_server_args(_server_args(enable_breakable_cuda_graph=True))
     with pytest.raises(ValueError, match="no.*audited high-quality deployment"):

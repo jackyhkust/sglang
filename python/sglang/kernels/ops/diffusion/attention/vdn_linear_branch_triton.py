@@ -42,7 +42,13 @@ def _check_head_dim(head_dim: int) -> None:
 
 
 def _cuda_bf16_rows(t: torch.Tensor) -> bool:
-    return t.is_cuda and t.dtype == torch.bfloat16 and t.stride(-1) == 1
+    # HIP tensors report is_cuda. These kernels are not validated on gfx950.
+    return (
+        torch.version.hip is None
+        and t.is_cuda
+        and t.dtype == torch.bfloat16
+        and t.stride(-1) == 1
+    )
 
 
 def _i32(t: torch.Tensor) -> torch.Tensor:
@@ -85,7 +91,8 @@ def can_use_vdn_frame_stats_prep(key: torch.Tensor, value: torch.Tensor) -> bool
 def can_use_vdn_gather_linear_state(prefix: torch.Tensor) -> bool:
     """prefix/suffix [F, H, dv, dk] fp32 on CUDA, power-of-two dk."""
     return (
-        prefix.is_cuda
+        torch.version.hip is None
+        and prefix.is_cuda
         and prefix.dtype == torch.float32
         and prefix.ndim == 4
         and _pow2_head_dim(prefix.shape[-1])

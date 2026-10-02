@@ -131,6 +131,29 @@ class RocmPlatform(Platform):
                     dtype,
                 )
 
+        elif selected_backend == AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3:
+            # VDN-H3. The CUDA resolver also checks NVIDIA compute capability and
+            # FlashAttention 3/4. Those do not exist on gfx950. The window softmax
+            # itself dispatches to AITER Triton varlen (see hybrid_window_attn_h3).
+            if dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    "hybrid_window_attn_h3 on ROCm needs torch.float16 or "
+                    f"torch.bfloat16, got {dtype}."
+                )
+            if head_size not in (64, 128):
+                raise ValueError(
+                    "hybrid_window_attn_h3 on ROCm supports head sizes 64 and 128, "
+                    f"got {head_size}."
+                )
+            logger.info(
+                "Using hybrid_window_attn_h3 on ROCm. Window softmax uses "
+                "AITER Triton varlen."
+            )
+            return (
+                "sglang.multimodal_gen.runtime.layers.attention.backends."
+                "hybrid_window_attn_h3.HybridWindowAttentionH3Backend"
+            )
+
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,

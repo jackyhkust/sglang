@@ -16,12 +16,15 @@ bf16 reduction order.
 from __future__ import annotations
 
 import functools
+import importlib
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
 
 import msgspec
 import torch
+import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
@@ -39,7 +42,11 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import VDNH3Layout
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
+logger = logging.getLogger(__name__)
+
 _DIT_BLOCK_PREFIX = re.compile(r"^blocks\.(\d+)\.")
+# "aiter" until the Triton varlen call is rejected, then "sdpa" for the process.
+_ROCM_SOFTMAX = "aiter"
 
 
 class HybridWindowAttentionH3Backend(AttentionBackend):
@@ -300,6 +307,91 @@ class HybridWindowAttentionH3MetadataBuilder(AttentionMetadataBuilder):
         )
 
 
+@functools.lru_cache(maxsize=1)
+def _aiter_triton_varlen_func():
+    # Grouped-varlen ASM (aiter.flash_attn_varlen_func) hangs on MiniMax-H3
+    # packed lengths on gfx942. gfx950 is unproven for that kernel, so the
+    # window and the full-cover dense leg both stay on the Triton path.
+    return importlib.import_module(
+        "aiter.ops.triton.attention.mha"
+    ).flash_attn_varlen_func
+
+
+def _sdpa_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    scale: float,
+    causal: bool = False,
+) -> torch.Tensor:
+    """One SDPA call per varlen segment. q and k lengths may differ."""
+    q_bounds = [int(x) for x in cu_q.tolist()]
+    k_bounds = [int(x) for x in cu_k.tolist()]
+    out = torch.empty_like(q)
+    gqa = q.shape[1] != k.shape[1]
+    for (qs, qe), (ks, ke) in zip(
+        zip(q_bounds[:-1], q_bounds[1:]),
+        zip(k_bounds[:-1], k_bounds[1:]),
+    ):
+        if qs == qe:
+            continue
+        attn = F.scaled_dot_product_attention(
+            q[qs:qe].transpose(0, 1).unsqueeze(0),
+            k[ks:ke].transpose(0, 1).unsqueeze(0),
+            v[ks:ke].transpose(0, 1).unsqueeze(0),
+            scale=scale,
+            is_causal=causal and (qe - qs) == (ke - ks),
+            enable_gqa=gqa,
+        )
+        out[qs:qe] = attn.squeeze(0).transpose(0, 1)
+    return out
+
+
+def _rocm_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    scale: float,
+    causal: bool = False,
+) -> torch.Tensor:
+    global _ROCM_SOFTMAX
+    if _ROCM_SOFTMAX == "sdpa":
+        return _sdpa_varlen(
+            q, k, v, cu_q=cu_q, cu_k=cu_k, scale=scale, causal=causal
+        )
+    try:
+        attn_out = _aiter_triton_varlen_func()(
+            q=q.contiguous(),
+            k=k.contiguous(),
+            v=v.contiguous(),
+            cu_seqlens_q=cu_q.to(device=q.device, dtype=torch.int32).contiguous(),
+            cu_seqlens_k=cu_k.to(device=k.device, dtype=torch.int32).contiguous(),
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            softmax_scale=scale,
+            causal=causal,
+        )
+    except (ImportError, TypeError) as exc:
+        logger.warning(
+            "AITER Triton varlen is unavailable for VDN-H3 window softmax (%s). "
+            "Using SDPA for the dense legs.",
+            exc,
+        )
+        _ROCM_SOFTMAX = "sdpa"
+        return _sdpa_varlen(
+            q, k, v, cu_q=cu_q, cu_k=cu_k, scale=scale, causal=causal
+        )
+    return attn_out[0] if isinstance(attn_out, tuple) else attn_out
+
+
 def _fa_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -312,20 +404,32 @@ def _fa_varlen(
     scale: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    attn_out = flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_k,
-        max_seqlen_q=max_q,
-        max_seqlen_k=max_k,
-        softmax_scale=scale,
-        causal=False,
-        ver=_flash_attn_backend.fa_ver,
-        out=out,
-    )
-    attn_out = attn_out[0] if isinstance(attn_out, tuple) else attn_out
+    if torch.version.hip is not None:
+        attn_out = _rocm_varlen(
+            q,
+            k,
+            v,
+            cu_q=cu_q,
+            cu_k=cu_k,
+            max_q=max_q,
+            max_k=max_k,
+            scale=scale,
+        )
+    else:
+        attn_out = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            softmax_scale=scale,
+            causal=False,
+            ver=_flash_attn_backend.fa_ver,
+            out=out,
+        )
+        attn_out = attn_out[0] if isinstance(attn_out, tuple) else attn_out
     if out is not None and attn_out.data_ptr() != out.data_ptr():
         out.copy_(attn_out)
         return out
@@ -345,6 +449,7 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
+        self.causal = causal
         self.softmax_scale = softmax_scale
         self.prefix = prefix
         match = _DIT_BLOCK_PREFIX.match(prefix)
@@ -366,8 +471,49 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        """Dense FlashAttention for the non-DiT layers this backend reaches."""
-        return self._dense_fallback.forward(query, key, value, attn_metadata)
+        """Dense attention for non-DiT callers (the Qwen3-VL text encoder).
+
+        That caller passes [batch, seq, heads, dim]. On ROCm this cannot go
+        through FlashAttention 3.
+        """
+        if torch.version.hip is None:
+            return self._dense_fallback.forward(query, key, value, attn_metadata)
+        if query.ndim != 4:
+            raise ValueError(
+                "hybrid_window_attn_h3 dense forward on ROCm expects "
+                f"[batch, seq, heads, dim], got {tuple(query.shape)}"
+            )
+        batch, seq_q, heads, dim = query.shape
+        seq_k = int(key.shape[1])
+        cu_q = torch.arange(
+            0,
+            (batch + 1) * seq_q,
+            seq_q,
+            device=query.device,
+            dtype=torch.int32,
+        )
+        cu_k = torch.arange(
+            0,
+            (batch + 1) * seq_k,
+            seq_k,
+            device=query.device,
+            dtype=torch.int32,
+        )
+        flat_q = query.reshape(batch * seq_q, heads, dim)
+        flat_k = key.reshape(batch * seq_k, key.shape[2], dim)
+        flat_v = value.reshape(batch * seq_k, value.shape[2], dim)
+        out = _rocm_varlen(
+            flat_q,
+            flat_k,
+            flat_v,
+            cu_q=cu_q,
+            cu_k=cu_k,
+            max_q=seq_q,
+            max_k=seq_k,
+            scale=self.softmax_scale,
+            causal=self.causal,
+        )
+        return out.view(batch, seq_q, heads, dim)
 
     def dense_varlen(
         self,
@@ -379,6 +525,19 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
+        # Full-cover clips and the token refiner take this path. FlashAttention
+        # 3/4 is CUDA-only, and the same packed length hangs AITER's ASM varlen.
+        if torch.version.hip is not None:
+            return _fa_varlen(
+                query,
+                key,
+                value,
+                cu_q=cu_seqlens,
+                cu_k=cu_seqlens,
+                max_q=max_seqlen,
+                max_k=max_seqlen,
+                scale=self.softmax_scale,
+            )
         return self._dense_fallback.forward_varlen(
             query,
             key,

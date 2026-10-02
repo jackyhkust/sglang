@@ -16,6 +16,68 @@ def get_padding(kernel_size, dilation=1):
     return int((kernel_size * dilation - dilation) / 2)
 
 
+_logged_miopen_find = False
+
+
+def _conv1d_as_matmul(conv, x):
+    """Conv1d via unfold + matmul. Avoids MIOpen for the shape it rejects."""
+    weight = conv.weight
+    bias = conv.bias
+    if conv.groups != 1:
+        raise RuntimeError("MIOpen conv1d fallback supports groups=1 only")
+    stride = int(conv.stride[0])
+    pad = int(conv.padding[0])
+    dilation = int(conv.dilation[0])
+    n, _channels, _length = x.shape
+    out_channels, in_channels, kernel = weight.shape
+    if pad:
+        x = torch.nn.functional.pad(x, (pad, pad))
+    window = dilation * (kernel - 1) + 1
+    # unfold -> [N, C, Lout, window]; keep every dilation-th tap -> [N, C, Lout, K]
+    columns = x.unfold(-1, window, stride)[..., ::dilation]
+    columns = columns.permute(0, 1, 3, 2).reshape(n, in_channels * kernel, -1)
+    weight = weight.reshape(out_channels, in_channels * kernel).to(dtype=columns.dtype)
+    y = torch.matmul(weight, columns)
+    if bias is not None:
+        y = y + bias.reshape(1, -1, 1).to(dtype=y.dtype)
+    return y
+
+
+def _apply_conv(conv, x):
+    """Run a conv. On ROCm, a rejected MIOpen shape uses unfold + matmul.
+
+    GemmFwdRest asks for a workspace after PyTorch already queried size 0, so
+    that conv raises miopenStatusUnknownError. The matmul path matches conv1d
+    for groups=1.
+    """
+    try:
+        return conv(x)
+    except RuntimeError as exc:
+        if torch.version.hip is None or "miopen" not in str(exc).lower():
+            raise
+        if not isinstance(conv, (Conv1d, ConvTranspose1d)) and not hasattr(
+            conv, "weight"
+        ):
+            raise
+        # ConvTranspose1d is a different layout. Only the dilated Conv1d
+        # path has failed here.
+        if isinstance(conv, ConvTranspose1d) or (
+            hasattr(conv, "weight") and conv.weight.ndim != 3
+        ):
+            raise
+        global _logged_miopen_find
+        if not _logged_miopen_find:
+            _logged_miopen_find = True
+            print(
+                "MIOpen conv1d failed "
+                f"(input={tuple(x.shape)} weight={tuple(conv.weight.shape)} "
+                f"stride={tuple(conv.stride)} pad={tuple(conv.padding)} "
+                f"dil={tuple(conv.dilation)}); using unfold+matmul",
+                flush=True,
+            )
+        return _conv1d_as_matmul(conv, x)
+
+
 # Adapted from https://github.com/EdwardDixon/snake under the MIT license.
 @torch.jit.script
 def snakebeta(x, alpha, beta):
@@ -142,9 +204,9 @@ class AMPBlock1(torch.nn.Module):
             a1 = next(activation_iter)
             a2 = next(activation_iter)
             xt = a1(x)
-            xt = c1(xt)
+            xt = _apply_conv(c1, xt)
             xt = a2(xt)
-            xt = c2(xt)
+            xt = _apply_conv(c2, xt)
             x = xt.add_(x)
 
         return x
@@ -228,12 +290,12 @@ class BigVGAN(torch.nn.Module):
 
     def forward(self, x):
         # Pre-conv
-        x = self.conv_pre(x)
+        x = _apply_conv(self.conv_pre, x)
 
         for i in range(self.num_upsamples):
             # Upsampling
             for i_up in range(len(self.ups[i])):
-                x = self.ups[i][i_up](x)
+                x = _apply_conv(self.ups[i][i_up], x)
             # AMP blocks
             xs = None
             for j in range(self.num_kernels):
@@ -245,7 +307,7 @@ class BigVGAN(torch.nn.Module):
 
         # Post-conv
         x = self.activation_post(x)
-        x = self.conv_post(x)
+        x = _apply_conv(self.conv_post, x)
         # Final tanh activation
         if self.use_tanh_at_final:
             x.tanh_()
