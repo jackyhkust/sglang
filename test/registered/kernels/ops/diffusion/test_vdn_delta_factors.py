@@ -12,6 +12,11 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
+pytestmark = pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="vdn_delta_factors is a CUDA JIT kernel; ROCm uses the eager Cholesky path",
+)
+
 HEAD_DIM = 128
 
 
