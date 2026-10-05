@@ -8,16 +8,17 @@ import torch.distributed as dist
 from sglang.test.test_utils import run_distributed_test
 
 
-def _check(rank: int) -> None:
+def _check(rank: int, heads: int = 6) -> None:
     from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
         _vdn_a2a_heads_to_rows,
         _vdn_a2a_rows_to_heads,
         _vdn_merge_heads,
     )
+    from sglang.multimodal_gen.runtime.layers.usp import _maybe_wait
 
     world = dist.get_world_size()
     device = torch.device("cuda", rank)
-    heads, head_dim, local_rows = 6, 32, 24
+    head_dim, local_rows = 32, 24
     local_heads = heads // world
     seq = local_rows * world
     # every rank builds the same global tensors, so a shard is checked by slicing
@@ -29,21 +30,24 @@ def _check(rank: int) -> None:
     mine = slice(rank * local_heads, (rank + 1) * local_heads)
     with torch.inference_mode():
         for name, field in (("q", q), ("scalars", scalars)):
-            work, recv = _vdn_a2a_rows_to_heads(
-                field[rows], ulysses_ws=world, role=name, process_group=dist.group.WORLD
+            recv = _maybe_wait(
+                _vdn_a2a_rows_to_heads(
+                    field[rows],
+                    ulysses_ws=world,
+                    role=name,
+                    process_group=dist.group.WORLD,
+                )
             )
-            work.wait()
             assert recv.is_contiguous()
             assert torch.equal(recv, field[:, mine])
         # inverse: this rank's heads for every row -> row shard, every head
-        work, back = _vdn_a2a_heads_to_rows(
+        back, shape = _vdn_a2a_heads_to_rows(
             q[:, mine].contiguous() * 2,
             ulysses_ws=world,
             role="out",
             process_group=dist.group.WORLD,
         )
-        work.wait()
-        assert torch.equal(_vdn_merge_heads(back), q[rows] * 2)
+        assert torch.equal(_vdn_merge_heads(_maybe_wait(back).view(shape)), q[rows] * 2)
     torch.cuda.synchronize()
 
 
@@ -51,5 +55,13 @@ def test_exchange_round_trip_two_ranks() -> None:
     run_distributed_test(_check, world_size=2)
 
 
+def test_exchange_round_trip_four_ranks() -> None:
+    # heads=8 (not the default 6) so local_heads=2 divides evenly at world=4;
+    # heads=6 would truncate to local_heads=1 (6 // 4) and silently drop 2
+    # heads from the check.
+    run_distributed_test(_check, world_size=4, heads=8)
+
+
 if __name__ == "__main__":
     test_exchange_round_trip_two_ranks()
+    test_exchange_round_trip_four_ranks()
