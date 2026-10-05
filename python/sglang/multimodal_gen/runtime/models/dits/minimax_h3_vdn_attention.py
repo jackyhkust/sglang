@@ -11,6 +11,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import torch
+import torch.distributed._functional_collectives as ft_c
 from torch import nn
 
 from sglang.kernels.ops.diffusion import (
@@ -30,7 +31,7 @@ from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
+from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer, _maybe_wait
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
     MiniMaxH3VDNLinearBranch,
@@ -213,8 +214,24 @@ def _vdn_a2a_rows_to_heads(
     ulysses_ws: int,
     role: str,
     process_group: torch.distributed.ProcessGroup,
-) -> tuple[torch.distributed.Work, torch.Tensor]:
-    # [L, H, d] row shard -> contiguous [S, H / ws, d] of this rank's heads
+) -> torch.Tensor:
+    # [L, H, d] row shard -> contiguous [S, H / ws, d] of this rank's heads.
+    #
+    # Uses the functional-collective API instead of raw async_op=True +
+    # Work.wait(): Dynamo cannot trace a Work handle at all (it is not a
+    # tensor/subclass it can model -- see gb0172 on the PyTorch graph-break
+    # site), which forced a hard graph break at every call under
+    # torch.compile. ft_c.all_to_all_single launches the collective
+    # immediately and returns a tensor (an AsyncCollectiveTensor in eager, a
+    # traced value under compile); the wait is deferred to _maybe_wait() at
+    # the point of use, which reproduces the same in-flight window the old
+    # Work handle gave the caller.
+    #
+    # Flattening (ulysses_ws, rows) into one leading dim up front turns this
+    # into an ordinary equal-split all_to_all_single (both sides see the same
+    # dim-0 size), so the result already has the [S, H/ws, d] layout the old
+    # differently-shaped recv buffer produced -- no reshape needed after the
+    # wait.
     rows, total_heads, head_dim = field.shape
     local_heads = total_heads // ulysses_ws
     send = _a2a_staging_buffer(
@@ -224,16 +241,8 @@ def _vdn_a2a_rows_to_heads(
         field.device,
     )
     send.copy_(field.view(rows, ulysses_ws, local_heads, head_dim).permute(1, 0, 2, 3))
-    recv = _a2a_staging_buffer(
-        role + "_recv",
-        (ulysses_ws * rows, local_heads, head_dim),
-        field.dtype,
-        field.device,
-    )
-    work = torch.distributed.all_to_all_single(
-        recv, send, group=process_group, async_op=True
-    )
-    return work, recv
+    flat_send = send.view(ulysses_ws * rows, local_heads, head_dim)
+    return ft_c.all_to_all_single(flat_send, None, None, process_group)
 
 
 def _vdn_a2a_heads_to_rows(
@@ -242,17 +251,20 @@ def _vdn_a2a_heads_to_rows(
     ulysses_ws: int,
     role: str,
     process_group: torch.distributed.ProcessGroup,
-) -> tuple[torch.distributed.Work, torch.Tensor]:
-    # [S, H / ws, d] -> [ws, L, H / ws, d] source-rank major; _vdn_merge_heads after wait
+) -> tuple[torch.Tensor, tuple[int, int, int, int]]:
+    # [S, H / ws, d] -> flat [ws * L, H / ws, d] source-rank major (same
+    # functional-collective swap as _vdn_a2a_rows_to_heads above). Returns
+    # the shape _vdn_merge_heads needs ([ws, L, H / ws, d]) alongside the
+    # still-unresolved tensor: the caller does
+    # ``_maybe_wait(recv).view(shape)`` at the point of use so the wait stays
+    # deferred exactly like the old Work.wait().
+    # role is kept in the signature for call-site symmetry with
+    # _vdn_a2a_rows_to_heads; no staging buffer is needed on this side since
+    # ft_c.all_to_all_single allocates its own output.
     seq_len, local_heads, head_dim = out.shape
     rows = seq_len // ulysses_ws
-    recv = _a2a_staging_buffer(
-        role + "_recv", (ulysses_ws, rows, local_heads, head_dim), out.dtype, out.device
-    )
-    work = torch.distributed.all_to_all_single(
-        recv, out.contiguous(), group=process_group, async_op=True
-    )
-    return work, recv
+    recv = ft_c.all_to_all_single(out.contiguous(), None, None, process_group)
+    return recv, (ulysses_ws, rows, local_heads, head_dim)
 
 
 def _vdn_merge_heads(recv: torch.Tensor) -> torch.Tensor:
@@ -463,9 +475,10 @@ def _vdn_ulysses_hybrid_core(
         num_frames=layout.num_frames,
         tokens_per_frame=layout.tokens_per_frame,
     )
-    frame_work = torch.distributed.all_reduce(
-        frame_sums, group=sp_group.device_group, async_op=True
-    )
+    # Same functional-collective swap as the a2a helpers above: Dynamo cannot
+    # trace the Work handle a raw async_op=True all_reduce returns, so the
+    # resume after frame_work.wait() used to graph break too.
+    frame_work = ft_c.all_reduce(frame_sums, "sum", sp_group.device_group)
     # the per-head scalars (beta, softmax gate) ride one more async field
     scalars = [beta] if softmax_gate is None else [beta, softmax_gate]
     inflight.append(
@@ -481,9 +494,7 @@ def _vdn_ulysses_hybrid_core(
         sp_group.all_gather(gate_hidden.contiguous(), dim=0), heads=head_range
     )
 
-    for work, _ in inflight:
-        work.wait()
-    q, k, v, scalars = (recv for _, recv in inflight)
+    q, k, v, scalars = (_maybe_wait(recv) for recv in inflight)
     beta = scalars[..., 0]
     if softmax_gate is not None:
         softmax_gate = scalars[..., 1]
@@ -492,13 +503,15 @@ def _vdn_ulysses_hybrid_core(
     )
     if meta.full_cover:
         softmax_out = softmax()
-        frame_work.wait()
+        # frame_work's result is unused on the full_cover path (there is no
+        # linear branch to feed it to); unlike the old Work handle, a
+        # functional-collective result that nothing ever reads needs no
+        # explicit wait -- CUDA stream ordering keeps it correct either way.
         return _vdn_return_to_rows(
             softmax_out, None, ulysses_ws=ulysses_ws, process_group=process_group
         )
 
     def linear_branch() -> torch.Tensor:
-        frame_work.wait()
         readout = _vdn_linear_readout(
             attention,
             meta,
@@ -507,7 +520,7 @@ def _vdn_ulysses_hybrid_core(
             v,
             beta=beta,
             linear_gate=linear_gate,
-            frame_mean=frame_sums / layout.tokens_per_frame,
+            frame_mean=_maybe_wait(frame_work) / layout.tokens_per_frame,
             head_range=head_range,
         )
         # rows go back to their owners: pad the non-video rows with zeros
@@ -527,14 +540,12 @@ def _vdn_ulysses_hybrid_core(
     side_stream = _linear_branch_stream(q.device)
     side_stream.wait_stream(main_stream)
     softmax_out = softmax()
-    softmax_work, softmax_recv = a2a_back(softmax_out, role="vdn_out0")
+    softmax_recv, softmax_shape = a2a_back(softmax_out, role="vdn_out0")
     with torch.cuda.stream(side_stream):
-        linear_work, linear_recv = a2a_back(linear_branch(), role="vdn_out1")
+        linear_recv, linear_shape = a2a_back(linear_branch(), role="vdn_out1")
     main_stream.wait_stream(side_stream)
-    softmax_work.wait()
-    linear_work.wait()
-    merged_softmax = _vdn_merge_heads(softmax_recv)
-    merged_linear = _vdn_merge_heads(linear_recv)
+    merged_softmax = _vdn_merge_heads(_maybe_wait(softmax_recv).view(softmax_shape))
+    merged_linear = _vdn_merge_heads(_maybe_wait(linear_recv).view(linear_shape))
     return merged_softmax, merged_linear.reshape(merged_linear.shape[0], -1)
 
 
@@ -553,10 +564,9 @@ def _vdn_return_to_rows(
         )
         for i, out in enumerate(branch_outputs)
     ]
-    merged = []
-    for work, recv in inflight:
-        work.wait()
-        merged.append(_vdn_merge_heads(recv))
+    merged = [
+        _vdn_merge_heads(_maybe_wait(recv).view(shape)) for recv, shape in inflight
+    ]
     linear_rows = (
         merged[1].reshape(merged[1].shape[0], -1) if linear_out is not None else None
     )
