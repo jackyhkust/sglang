@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 
 import msgspec
 import torch
@@ -67,6 +68,10 @@ _FP32 = torch.float32
 # trained checkpoints, not a knob (see VDN BidirectionalLinearBranch).
 TEXT_STATE_SCALE = 0.5
 SHORT_CONV_KERNEL = 5
+
+# "inv" replaces the Cholesky chain with linalg.inv. rocSOLVER before 0.13 runs a
+# batched 128x128 potrf as ~126 tiny launches, which makes inv ~15x faster there.
+SPD_INVERSE = os.environ.get("SGLANG_VDN_SPD_INVERSE", "cholesky")
 
 
 # --------------------------------------------------------------------------
@@ -522,10 +527,13 @@ def delta_factor_apply(
         )
         if can_use_vdn_delta_factors(A32, B32, alpha32):
             return vdn_delta_factors(A32, B32, alpha32)
-    chol = torch.linalg.cholesky(A32 + eye)
-    # (I+A)^-1 = L^-T L^-1: a batched trsm at 128x128 is far slower than the GEMM
-    linv = torch.linalg.solve_triangular(chol, eye, upper=False, left=True)
-    inv = linv.transpose(-1, -2) @ linv
+    if SPD_INVERSE == "inv":
+        inv = torch.linalg.inv(A32 + eye)
+    else:
+        chol = torch.linalg.cholesky(A32 + eye)
+        # (I+A)^-1 = L^-T L^-1: a batched trsm at 128x128 is far slower than the GEMM
+        linv = torch.linalg.solve_triangular(chol, eye, upper=False, left=True)
+        inv = linv.transpose(-1, -2) @ linv
     transition = alpha.unsqueeze(-1) * inv
     injection = B32 @ inv
     return transition, injection
