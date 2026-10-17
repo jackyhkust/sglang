@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Attention module for the MiniMax H3 visual VAE (inference-only bundle).
+import importlib.util
+import os
 from contextlib import nullcontext
 from typing import Optional
 
@@ -19,13 +21,48 @@ from sglang.multimodal_gen.runtime.platforms import (
 from .vit_utils import _env_flag, apply_rotary_pos_emb_qk
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-_FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and "gfx95" in str(
-    torch.cuda.get_device_properties(0).gcnArchName
-)
+_ROCM_VIT_ATTN_BACKENDS = ("aiter", "math", "sdpa")
+
+
+def _rocm_vit_attention_backend() -> Optional[str]:
+    # Fused ROCm SDPA (flash and efficient) returns intermittently wrong outputs at
+    # the ViT shapes on gfx950 with HIP 7.16 and 7.17 (torch 2.13). AITER CK flash
+    # attention stays at the fp64 reference and is faster; math SDPA is exact but
+    # upcasts to fp32 and runs unfused.
+    if not (
+        current_platform.is_rocm()
+        and "gfx95" in str(torch.cuda.get_device_properties(0).gcnArchName)
+    ):
+        return None
+    backend = os.environ.get("SGLANG_MINIMAX_H3_VAE_ROCM_ATTN", "aiter").strip().lower()
+    if backend not in _ROCM_VIT_ATTN_BACKENDS:
+        raise ValueError(
+            f"SGLANG_MINIMAX_H3_VAE_ROCM_ATTN={backend!r}; "
+            f"expected one of {_ROCM_VIT_ATTN_BACKENDS}"
+        )
+    if backend == "aiter" and importlib.util.find_spec("aiter") is None:
+        logger.warning(
+            "aiter is not installed; MiniMax H3 VAE attention uses math SDPA."
+        )
+        return "math"
+    return backend
+
+
+_ROCM_VIT_ATTN = _rocm_vit_attention_backend()
 
 
 def _sdpa_attention(query, key, value):
-    context = sdpa_kernel([SDPBackend.MATH]) if _FORCE_ROCM_MATH_SDPA else nullcontext()
+    if _ROCM_VIT_ATTN == "aiter" and query.dtype in (torch.float16, torch.bfloat16):
+        import aiter
+
+        # aiter takes [B, S, H, D], the layout the decoder already holds.
+        out = aiter.flash_attn_func(query, key, value, dropout_p=0.0, causal=False)
+        return out[0] if isinstance(out, tuple) else out
+    context = (
+        sdpa_kernel([SDPBackend.MATH])
+        if _ROCM_VIT_ATTN in ("aiter", "math")
+        else nullcontext()
+    )
     with context:
         return F.scaled_dot_product_attention(
             query.transpose(1, 2),

@@ -90,6 +90,87 @@ def test_vit_qk_norm_supports_affine_free_rmsnorm():
     assert output.shape == hidden_states.shape
 
 
+_VAE_ATTN = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention"
+
+
+@pytest.mark.parametrize(
+    ("rocm", "arch", "env", "aiter_found", "expected"),
+    [
+        (False, "gfx950", None, True, None),
+        (True, "gfx942", None, True, None),
+        (True, "gfx950", None, True, "aiter"),
+        (True, "gfx950", None, False, "math"),
+        (True, "gfx950", "math", True, "math"),
+        (True, "gfx950", "SDPA", True, "sdpa"),
+    ],
+)
+def test_rocm_vit_attention_backend_selection(
+    monkeypatch, rocm, arch, env, aiter_found, expected
+):
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
+        attention,
+    )
+
+    if env is None:
+        monkeypatch.delenv("SGLANG_MINIMAX_H3_VAE_ROCM_ATTN", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_MINIMAX_H3_VAE_ROCM_ATTN", env)
+    props = mock.Mock(gcnArchName=f"{arch}:sramecc+:xnack-")
+    with (
+        mock.patch(f"{_VAE_ATTN}.current_platform.is_rocm", return_value=rocm),
+        mock.patch("torch.cuda.get_device_properties", return_value=props),
+        mock.patch(
+            "importlib.util.find_spec",
+            return_value=mock.Mock() if aiter_found else None,
+        ),
+    ):
+        assert attention._rocm_vit_attention_backend() == expected
+
+
+def test_rocm_vit_attention_backend_rejects_unknown(monkeypatch):
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
+        attention,
+    )
+
+    monkeypatch.setenv("SGLANG_MINIMAX_H3_VAE_ROCM_ATTN", "flash")
+    props = mock.Mock(gcnArchName="gfx950")
+    with (
+        mock.patch(f"{_VAE_ATTN}.current_platform.is_rocm", return_value=True),
+        mock.patch("torch.cuda.get_device_properties", return_value=props),
+        pytest.raises(ValueError, match="SGLANG_MINIMAX_H3_VAE_ROCM_ATTN"),
+    ):
+        attention._rocm_vit_attention_backend()
+
+
+def test_vit_aiter_attention_keeps_bshd_layout_and_fp32_uses_math():
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
+        attention,
+    )
+
+    calls = []
+    fake_aiter = mock.Mock()
+    fake_aiter.flash_attn_func.side_effect = lambda q, k, v, **kw: (
+        calls.append((q.shape, kw)) or q
+    )
+    query = torch.randn(2, 5, 3, 64, dtype=torch.float16)
+    with (
+        mock.patch.object(attention, "_ROCM_VIT_ATTN", "aiter"),
+        mock.patch.dict(sys.modules, {"aiter": fake_aiter}),
+    ):
+        out = attention._sdpa_attention(query, query, query)
+        assert out is query
+        assert calls == [((2, 5, 3, 64), {"dropout_p": 0.0, "causal": False})]
+
+        fp32 = torch.randn(1, 4, 2, 8)
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            fp32.transpose(1, 2), fp32.transpose(1, 2), fp32.transpose(1, 2)
+        ).transpose(1, 2)
+        torch.testing.assert_close(
+            attention._sdpa_attention(fp32, fp32, fp32), reference
+        )
+        assert len(calls) == 1
+
+
 def test_audio_vae_attention_defaults_to_local_sdpa_and_allows_fa():
     class RecordingFA(nn.Module):
         backend = AttentionBackendEnum.FA
