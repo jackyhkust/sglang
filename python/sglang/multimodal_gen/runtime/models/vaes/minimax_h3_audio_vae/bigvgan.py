@@ -10,6 +10,8 @@
 # ``Activation1d`` from ``runtime/models/vaes/alias_free.py`` (sibling of
 # this package, alongside ``common.py``) instead of each keeping its own copy.
 
+import os
+
 import torch
 import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, Parameter
@@ -23,6 +25,9 @@ def get_padding(kernel_size, dilation=1):
 
 
 _logged_miopen_find = False
+_ROCM_DILATED_CONV_AS_MATMUL = os.environ.get(
+    "SGLANG_MINIMAX_H3_AUDIO_DILATED_CONV_MATMUL", "1"
+).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _conv1d_as_matmul(conv, x):
@@ -55,7 +60,19 @@ def _apply_conv(conv, x):
     GemmFwdRest asks for a workspace after PyTorch already queried size 0, so
     that conv raises miopenStatusUnknownError. The matmul path matches conv1d
     for groups=1.
+
+    MIOpen runs a dilated fp32 Conv1d with naive_conv (3-9 ms per resblock conv on
+    gfx950, about 50x the matmul path), so ROCm sends those to unfold + matmul first.
     """
+    if (
+        torch.version.hip is not None
+        and _ROCM_DILATED_CONV_AS_MATMUL
+        and isinstance(conv, Conv1d)
+        and conv.groups == 1
+        and int(conv.dilation[0]) > 1
+        and conv.weight.dtype == torch.float32
+    ):
+        return _conv1d_as_matmul(conv, x)
     try:
         return conv(x)
     except RuntimeError as exc:
