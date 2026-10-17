@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import functools
 import importlib
+import inspect
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -41,12 +43,27 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import VDNH3Layout
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.srt.utils.common import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
 _DIT_BLOCK_PREFIX = re.compile(r"^blocks\.(\d+)\.")
 # "aiter" until the Triton varlen call is rejected, then "sdpa" for the process.
 _ROCM_SOFTMAX = "aiter"
+
+
+def _default_rocm_window_backend() -> str:
+    # AITER CK varlen hangs on MiniMax-H3 packed lengths on gfx942; gfx950 runs it.
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return "triton"
+    return "aiter_ck" if is_gfx95_supported() else "triton"
+
+
+# ROCm DiT varlen kernel: "aiter_ck" (AITER CK/ASM, gfx950 default) or "triton".
+_ROCM_WINDOW_BACKEND = (
+    os.environ.get("SGLANG_VDN_WINDOW_BACKEND", "").lower()
+    or _default_rocm_window_backend()
+)
 
 
 class HybridWindowAttentionH3Backend(AttentionBackend):
@@ -303,12 +320,80 @@ class HybridWindowAttentionH3MetadataBuilder(AttentionMetadataBuilder):
 
 @functools.lru_cache(maxsize=1)
 def _aiter_triton_varlen_func():
-    # Grouped-varlen ASM (aiter.flash_attn_varlen_func) hangs on MiniMax-H3
-    # packed lengths on gfx942. gfx950 is unproven for that kernel, so the
-    # window and the full-cover dense leg both stay on the Triton path.
+    # The DiT window falls back here off gfx950 or with
+    # SGLANG_VDN_WINDOW_BACKEND=triton; the text-encoder dense path always uses it.
     return importlib.import_module(
         "aiter.ops.triton.attention.mha"
     ).flash_attn_varlen_func
+
+
+def _register_aiter_ck_varlen_op():
+    # Registered at import, not on first call: Dynamo cannot trace the aiter
+    # import or the op registration, so the op must exist before compile.
+    import aiter
+
+    params = inspect.signature(aiter.flash_attn_varlen_func).parameters
+    how_v3 = 2 if "how_v3_bf16_cvt" in params else None
+
+    def _vdn_aiter_ck_varlen(q, k, v, cu_q, cu_k, max_q, max_k, scale):
+        kwargs = {
+            "dropout_p": 0.0,
+            "softmax_scale": float(scale),
+            "causal": False,
+            "return_lse": False,
+            "return_attn_probs": False,
+        }
+        if how_v3 is not None:
+            kwargs["how_v3_bf16_cvt"] = how_v3
+        out = aiter.flash_attn_varlen_func(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            cu_q.to(device=q.device, dtype=torch.int32).contiguous(),
+            cu_k.to(device=k.device, dtype=torch.int32).contiguous(),
+            max_seqlen_q=int(max_q),
+            max_seqlen_k=int(max_k),
+            **kwargs,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    def _vdn_aiter_ck_varlen_fake(q, k, v, cu_q, cu_k, max_q, max_k, scale):
+        return torch.empty_like(q)
+
+    # postponed annotations: the op schema needs real types
+    annotations = {
+        "q": torch.Tensor,
+        "k": torch.Tensor,
+        "v": torch.Tensor,
+        "cu_q": torch.Tensor,
+        "cu_k": torch.Tensor,
+        "max_q": int,
+        "max_k": int,
+        "scale": float,
+        "return": torch.Tensor,
+    }
+    _vdn_aiter_ck_varlen.__annotations__ = annotations
+    _vdn_aiter_ck_varlen_fake.__annotations__ = dict(annotations)
+    op = torch.library.custom_op("sglang::vdn_aiter_ck_varlen", mutates_args=())(
+        _vdn_aiter_ck_varlen
+    )
+    op.register_fake(_vdn_aiter_ck_varlen_fake)
+    return op
+
+
+_AITER_CK_VARLEN_OP = None
+if torch.version.hip is not None and _ROCM_WINDOW_BACKEND == "aiter_ck":
+    try:
+        _AITER_CK_VARLEN_OP = _register_aiter_ck_varlen_op()
+        logger.info(
+            "VDN-H3 window softmax: AITER CK varlen (sglang::vdn_aiter_ck_varlen)."
+        )
+    except (ImportError, AttributeError) as exc:
+        logger.warning(
+            "AITER CK varlen is unavailable for VDN-H3 window softmax (%s). "
+            "Using AITER Triton varlen.",
+            exc,
+        )
 
 
 def _sdpa_varlen(
@@ -358,9 +443,7 @@ def _rocm_varlen(
 ) -> torch.Tensor:
     global _ROCM_SOFTMAX
     if _ROCM_SOFTMAX == "sdpa":
-        return _sdpa_varlen(
-            q, k, v, cu_q=cu_q, cu_k=cu_k, scale=scale, causal=causal
-        )
+        return _sdpa_varlen(q, k, v, cu_q=cu_q, cu_k=cu_k, scale=scale, causal=causal)
     try:
         attn_out = _aiter_triton_varlen_func()(
             q=q.contiguous(),
@@ -380,9 +463,7 @@ def _rocm_varlen(
             exc,
         )
         _ROCM_SOFTMAX = "sdpa"
-        return _sdpa_varlen(
-            q, k, v, cu_q=cu_q, cu_k=cu_k, scale=scale, causal=causal
-        )
+        return _sdpa_varlen(q, k, v, cu_q=cu_q, cu_k=cu_k, scale=scale, causal=causal)
     return attn_out[0] if isinstance(attn_out, tuple) else attn_out
 
 
@@ -398,7 +479,11 @@ def _fa_varlen(
     scale: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if torch.version.hip is not None:
+    if _AITER_CK_VARLEN_OP is not None:
+        attn_out = _AITER_CK_VARLEN_OP(
+            q, k, v, cu_q, cu_k, int(max_q), int(max_k), float(scale)
+        )
+    elif torch.version.hip is not None:
         attn_out = _rocm_varlen(
             q,
             k,

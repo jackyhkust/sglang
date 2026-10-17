@@ -21,8 +21,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import VDNH3Layout
 
-# ROCm admits the same backend and runs the window through AITER Triton varlen,
-# falling back to SDPA. HIP reports torch.cuda.is_available().
+# ROCm admits the same backend and runs the window through AITER CK varlen on
+# gfx950, AITER Triton varlen elsewhere (falling back to SDPA). HIP reports
+# torch.cuda.is_available().
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="hybrid_window_attn_h3 kernels need a GPU",
@@ -259,6 +260,21 @@ def test_metadata_layout_mismatch_is_rejected() -> None:
             cu_seqlens_host=(0, layout.used - 48, layout.seq_len),
             attn_metadata=meta,
         )
+
+
+@pytest.mark.parametrize(
+    ("hip", "gfx95", "expected"),
+    [(None, True, "triton"), ("7.0", False, "triton"), ("7.0", True, "aiter_ck")],
+)
+def test_default_rocm_window_backend(monkeypatch, hip, gfx95, expected) -> None:
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        hybrid_window_attn_h3 as backend,
+    )
+
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(backend, "is_gfx95_supported", lambda: gfx95)
+    assert backend._default_rocm_window_backend() == expected
 
 
 if __name__ == "__main__":
