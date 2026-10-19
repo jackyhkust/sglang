@@ -525,7 +525,7 @@ def delta_factor_apply(
             B32.contiguous(),
             alpha.float().contiguous(),
         )
-        if can_use_vdn_delta_factors(A32, B32, alpha32):
+        if can_use_vdn_delta_factors(A32.device, A32.dtype, A32.shape[-1]):
             return vdn_delta_factors(A32, B32, alpha32)
     if SPD_INVERSE == "inv":
         inv = torch.linalg.inv(A32 + eye)
