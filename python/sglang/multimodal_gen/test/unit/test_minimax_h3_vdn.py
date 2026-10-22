@@ -73,9 +73,9 @@ def test_registry_resolves_vdn_h3_configs() -> None:
 
 def test_vdn_h3_sampling_defaults_and_rejections() -> None:
     params = VDNH3SamplingParams(prompt="p")
-    assert params.num_inference_steps == 9  # 8 NFE
-    with pytest.raises(ValueError, match="nine sigma grid points"):
-        VDNH3SamplingParams(prompt="p", num_inference_steps=8)
+    assert params.num_inference_steps == 8
+    with pytest.raises(ValueError, match="accepts eight inference steps"):
+        VDNH3SamplingParams(prompt="p", num_inference_steps=9)
     comparison = VDNH3SamplingParams(prompt="p", num_inference_steps=50)
     assert comparison.num_inference_steps == 50
     fl2va = VDNH3SamplingParams(
