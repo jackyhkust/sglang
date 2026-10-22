@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any
 
 import torch
@@ -21,7 +23,12 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod as SRTFp8LinearMethod
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.utils import copy_or_rebind_param
+
+logger = logging.getLogger(__name__)
+
+_LOGGED_MXFP8_LAYER_DECISIONS: set = set()
 
 
 class MXFP8Config(SRTFp8Config, QuantizationConfig):
@@ -74,6 +81,25 @@ class MXFP8Config(SRTFp8Config, QuantizationConfig):
         if not isinstance(layer, LinearBase):
             return None
         if self.layer_markers is not None and prefix not in self.layer_markers:
+            return UnquantizedLinearMethod()
+        skipped = is_layer_skipped(
+            prefix,
+            self.ignored_layers or [],
+            fused_mapping=self.packed_modules_mapping,
+        )
+        if os.environ.get("SGLANG_LOG_FP8_LAYERS") == "1":
+            proj_name = prefix.split(".")[-1]
+            decision = "bf16(skip)" if skipped else "mxfp8"
+            key = (proj_name, decision)
+            if key not in _LOGGED_MXFP8_LAYER_DECISIONS:
+                _LOGGED_MXFP8_LAYER_DECISIONS.add(key)
+                logger.info(
+                    "FP8 layer decision: %s -> %s (e.g. prefix=%s)",
+                    proj_name,
+                    decision,
+                    prefix,
+                )
+        if skipped:
             return UnquantizedLinearMethod()
         if current_platform.is_npu():
             return NPUMXFP8LinearMethod(self)
