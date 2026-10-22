@@ -21,8 +21,64 @@ from sglang.kernels.ops.diffusion import (
     mxfp8_quantize_swizzled,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.multimodal_gen.runtime.layers.utils import direct_register_custom_op
 
 _E8M0 = torch.float8_e8m0fnu
+
+
+def _mxfp8_quantize_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return mxfp8_quantize_swizzled(x)
+
+
+def _mxfp8_quantize_act_fake(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, k = x.shape
+    n_groups = k // 32
+    scale_numel = -(-rows // 128) * 128 * (-(-n_groups // 4) * 4)
+    return (
+        torch.empty((rows, k), dtype=torch.float8_e4m3fn, device=x.device),
+        torch.empty((scale_numel,), dtype=torch.uint8, device=x.device),
+    )
+
+
+# The Triton quantizer refuses to run while torch.compile traces; as an opaque
+# op, dynamo/inductor see only the fake impl and the kernel runs at execution.
+direct_register_custom_op(
+    op_name="mxfp8_quantize_act",
+    op_func=_mxfp8_quantize_act,
+    mutates_args=[],
+    fake_impl=_mxfp8_quantize_act_fake,
+)
+
+
+def _mxfp8_gemm(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    return mxfp8_scaled_mm(
+        a,
+        a_scale,
+        weight,
+        weight_scale,
+        bias=bias,
+        output_dtype=output_dtype,
+    )
+
+
+def _mxfp8_gemm_fake(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.empty(
+        (a.shape[0], weight.shape[0]), dtype=output_dtype, device=a.device
+    )
 
 
 def mxfp8_scaled_mm(
@@ -46,6 +102,15 @@ def mxfp8_scaled_mm(
         bias=bias,
         output_dtype=output_dtype,
     )
+
+
+# Inductor cannot lower block-scaled _scaled_mm_v2 with swizzled scales.
+direct_register_custom_op(
+    op_name="mxfp8_gemm",
+    op_func=_mxfp8_gemm,
+    mutates_args=[],
+    fake_impl=_mxfp8_gemm_fake,
+)
 
 
 class MXFP8OnlineLinearMethod(Fp8LinearMethod):
@@ -86,17 +151,17 @@ class MXFP8OnlineLinearMethod(Fp8LinearMethod):
             lead, output_dtype = a.shape[:-1], torch.bfloat16
         else:
             lead, output_dtype = x.shape[:-1], x.dtype
-            a, a_scale = mxfp8_quantize_swizzled(
+            a, a_scale = torch.ops.sglang.mxfp8_quantize_act(
                 x.reshape(-1, x.shape[-1]).contiguous()
             )
             a_scale = a_scale.view(_E8M0)
-        out = mxfp8_scaled_mm(
+        out = torch.ops.sglang.mxfp8_gemm(
             a.reshape(-1, a.shape[-1]),
             a_scale,
             layer.weight,
             layer.weight_scale,
-            bias=bias,
-            output_dtype=output_dtype,
+            bias,
+            output_dtype,
         )
         return out.view(*lead, out.shape[-1])
 
