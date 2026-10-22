@@ -41,8 +41,10 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
         if quantization in ("none", "bf16"):
             server_args.quantization = None
         elif (
-            current_platform.is_blackwell() or current_platform.is_sm120()
-        ) and quantization in ("", "fp8"):
+            (current_platform.is_blackwell() or current_platform.is_sm120())
+            and quantization in ("", "fp8")
+            and os.environ.get("SGLANG_FP8_PER_TENSOR_CUDNN") != "1"
+        ):
             # the block-scaled GEMM exists on SM100+ only; before that fp8 stays per-channel
             server_args.quantization = "mxfp8"
         # an unset backend would resolve to the platform default (dense FA)

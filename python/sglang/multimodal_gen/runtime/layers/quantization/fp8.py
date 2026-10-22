@@ -114,6 +114,12 @@ class Fp8Config(SRTFp8Config, QuantizationConfig):
                     )
             if skipped:
                 return UnquantizedLinearMethod()
+            if _is_cuda and os.environ.get("SGLANG_FP8_PER_TENSOR_CUDNN") == "1":
+                from sglang.multimodal_gen.runtime.layers.quantization.fp8_pt_cudnn import (
+                    Fp8PerTensorCudnnLinearMethod,
+                )
+
+                return Fp8PerTensorCudnnLinearMethod(self)
             return Fp8LinearMethod(self)
         return None
 
