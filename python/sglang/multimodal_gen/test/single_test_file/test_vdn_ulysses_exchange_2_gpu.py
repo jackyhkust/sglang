@@ -9,12 +9,12 @@ from sglang.test.test_utils import run_distributed_test
 
 
 def _check(rank: int, heads: int = 6) -> None:
+    from sglang.multimodal_gen.runtime.layers.usp import _maybe_wait
     from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
         _vdn_a2a_heads_to_rows,
         _vdn_a2a_rows_to_heads,
         _vdn_merge_heads,
     )
-    from sglang.multimodal_gen.runtime.layers.usp import _maybe_wait
 
     world = dist.get_world_size()
     device = torch.device("cuda", rank)
