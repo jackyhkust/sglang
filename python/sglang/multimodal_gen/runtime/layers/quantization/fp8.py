@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -86,6 +87,11 @@ if USE_AITER or _use_hip_int4:
 
 logger = logging.getLogger(__name__)
 
+# Diagnostic: log the per-module FP8 vs bf16 decision once per unique leaf name.
+# Inert unless SGLANG_LOG_FP8_LAYERS=1. Used to verify the --quantization-ignored-layers
+# scope (e.g. matching xDiT's 5-layer VDN-H3 set) at runtime.
+_LOGGED_FP8_LAYER_DECISIONS: set = set()
+
 
 def _apply_gfx1250_triton_fp8(
     *,
@@ -126,11 +132,24 @@ class Fp8Config(SRTFp8Config, QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(
+            skipped = is_layer_skipped(
                 prefix,
                 self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
-            ):
+            )
+            if os.environ.get("SGLANG_LOG_FP8_LAYERS") == "1":
+                proj_name = prefix.split(".")[-1]
+                decision = "bf16(skip)" if skipped else "fp8"
+                key = (proj_name, decision)
+                if key not in _LOGGED_FP8_LAYER_DECISIONS:
+                    _LOGGED_FP8_LAYER_DECISIONS.add(key)
+                    logger.info(
+                        "FP8 layer decision: %s -> %s (e.g. prefix=%s)",
+                        proj_name,
+                        decision,
+                        prefix,
+                    )
+            if skipped:
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         return None

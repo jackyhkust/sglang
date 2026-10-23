@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
@@ -28,6 +29,16 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    When tracing the code, the result tensor is not an AsyncCollectiveTensor,
+    so we cannot call ``wait()``.
+    """
+    if isinstance(tensor, ft_c.AsyncCollectiveTensor):
+        return tensor.wait()
+    return tensor
 
 
 _A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}

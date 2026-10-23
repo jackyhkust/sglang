@@ -673,7 +673,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         if not (
             current_platform.is_cuda()
-            or current_platform.is_hip()
+            or current_platform.is_rocm()
             or current_platform.is_cpu()
             or current_platform.is_mps()
             or current_platform.is_npu()

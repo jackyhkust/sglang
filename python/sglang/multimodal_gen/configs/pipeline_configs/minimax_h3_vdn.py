@@ -2,6 +2,7 @@
 """VDN-H3 pipeline config: the MiniMax-H3 deployment envelope for the hybrid
 attention checkpoint."""
 
+import os
 from dataclasses import dataclass
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
@@ -11,6 +12,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -64,12 +68,21 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
                 "VDN-H3 does not support --ring-degree > 1; use Ulysses sequence "
                 "parallelism."
             )
-        if server_args.enable_torch_compile or server_args.enable_breakable_cuda_graph:
+        if server_args.enable_breakable_cuda_graph:
             # BCG keeps one pool per captured segment and exhausts 183 GB at 104k rows
             raise ValueError(
-                "VDN-H3 hybrid attention is not validated under torch.compile or "
-                "the breakable CUDA graph yet; disable them."
+                "VDN-H3 hybrid attention is not validated under the breakable "
+                "CUDA graph yet; disable it."
             )
+        if server_args.enable_torch_compile:
+            logger.warning(
+                "VDN-H3 hybrid attention is not validated under torch.compile; "
+                "continuing because --enable-torch-compile was set."
+            )
+        if os.environ.get("SGLANG_MINIMAX_H3_VAE_TILING", "1") == "0":
+            self.vae_config.use_tiling = False
+            self.vae_config.use_parallel_tiling = False
+            logger.info("MiniMax H3 video VAE tiling is off for this run.")
         super().validate_server_args(server_args)
 
 

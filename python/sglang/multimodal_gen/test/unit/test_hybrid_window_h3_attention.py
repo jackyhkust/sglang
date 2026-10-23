@@ -20,14 +20,13 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_
     window_mask_reference,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import VDNH3Layout
-from sglang.multimodal_gen.runtime.platforms import current_platform
 
-# torch.cuda.is_available() is also True under ROCm, but the backend lives on the
-# CUDA platform only (RocmPlatform rejects hybrid_window_attn_h3 outright and has
-# no _prepare_flash_attention_for_blackwell), so gate on the platform itself.
+# ROCm admits the same backend and runs the window through AITER CK varlen on
+# gfx950, AITER Triton varlen elsewhere (falling back to SDPA). HIP reports
+# torch.cuda.is_available().
 requires_cuda = pytest.mark.skipif(
-    not current_platform.is_cuda(),
-    reason="hybrid_window_attn_h3 kernels need NVIDIA CUDA",
+    not torch.cuda.is_available(),
+    reason="hybrid_window_attn_h3 kernels need a GPU",
 )
 
 # ragged on purpose: 70 and 100 are not tile multiples, 12 frames is not a chunk multiple
@@ -84,10 +83,13 @@ def _masked_reference(q, k, v, mask: torch.Tensor, used: int) -> torch.Tensor:
 
 
 def _prepare_flash_attention() -> None:
-    # the platform resolver runs this before the first forward; a direct impl must too
+    # the CUDA platform resolver runs this before the first forward; a direct
+    # impl must too. ROCm has no FlashAttention prepare step.
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    current_platform._prepare_flash_attention_for_blackwell()
+    prepare = getattr(current_platform, "_prepare_flash_attention_for_blackwell", None)
+    if prepare is not None:
+        prepare()
 
 
 def _impl() -> HybridWindowAttentionH3Impl:
@@ -258,6 +260,21 @@ def test_metadata_layout_mismatch_is_rejected() -> None:
             cu_seqlens_host=(0, layout.used - 48, layout.seq_len),
             attn_metadata=meta,
         )
+
+
+@pytest.mark.parametrize(
+    ("hip", "gfx95", "expected"),
+    [(None, True, "triton"), ("7.0", False, "triton"), ("7.0", True, "aiter_ck")],
+)
+def test_default_rocm_window_backend(monkeypatch, hip, gfx95, expected) -> None:
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        hybrid_window_attn_h3 as backend,
+    )
+
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(backend, "is_gfx95_supported", lambda: gfx95)
+    assert backend._default_rocm_window_backend() == expected
 
 
 if __name__ == "__main__":

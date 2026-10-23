@@ -25,6 +25,11 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
+pytestmark = pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="VDN fused linear-branch kernels are CUDA-only; ROCm uses the eager path",
+)
+
 FRAMES, TOKENS, HEADS, HEAD_DIM = 6, 24, 3, 32
 
 

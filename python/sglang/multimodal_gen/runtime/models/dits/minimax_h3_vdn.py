@@ -803,8 +803,10 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         self.hybrid = hybrid
         self.local_heads = local_heads
         self.head_dim = arch.attention_head_dim
-        # tests flip this to compare the fused Triton stages with the eager chain
-        self.fused_kernels = True
+        # tests flip this to compare the fused Triton stages with the eager chain.
+        # On HIP the fused gates would pass (tensors report is_cuda) and the
+        # CUDA JIT would build. Eager Cholesky is the ROCm path.
+        self.fused_kernels = torch.version.hip is None
         hidden = arch.hidden_size
         channels = local_heads * self.head_dim
         self.short_conv = (
